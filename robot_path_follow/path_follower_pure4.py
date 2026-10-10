@@ -218,7 +218,7 @@ class PathFollowerNode(Node):
         self.left_pub = self.create_publisher(Float64, g("left_topic"), 10)
         self.right_pub = self.create_publisher(Float64, g("right_topic"), 10)
 
-        self.create_subscription(Path, "world_path", self.on_path, LATCHED_QOS)
+        self.create_subscription(Path, "safe_world_path", self.on_path, LATCHED_QOS)
         self.create_subscription(PoseStamped, "robot_pose", self.on_pose, 10)
         self.create_timer(1.0 / float(g("control_rate")), self.control)
 

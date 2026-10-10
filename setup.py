@@ -32,6 +32,7 @@ setup(
             "path_follower_pure = robot_path_follow.path_follower_pure:main",
             "path_follower_pure3 = robot_path_follow.path_follower_pure3:main",
             "path_follower_pure4 = robot_path_follow.path_follower_pure4:main",
+            "obstacle_planner = robot_path_follow.obstacle_planner:main",
         ],
     },
 )
