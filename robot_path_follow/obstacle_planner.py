@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
 obstacle_planner_node.py
-Intercepts the camera feed and world path to perform dynamic obstacle avoidance.
-Generates a metric C-Space costmap, calculates an A* detour, and publishes /safe_world_path.
+Static-obstacle planner. Plans ONCE per GO, never continuously.
 
-The robot itself is removed from the foreground mask using:
-  - a parallax-shifted body mask (robot has height, homography is floor-only)
-  - a trail of recent positions (covers pose / image lag while moving)
-  - a metric margin around the robot
-  - blob ownership (foreground blobs mostly inside the robot zone are erased entirely)
+Workflow:
+  1. Node starts and learns the empty floor for `learning_frames` frames, then freezes the model.
+  2. You place static obstacles.
+  3. You press GO. The planner takes a short burst of frames (`plan_frames`), keeps only pixels
+     that are foreground in most of them (majority vote), builds the C-Space costmap, checks the
+     path, and, if blocked, computes ONE A* detour.
+  4. The result is published ONCE on /safe_world_path (latched). Nothing changes afterwards
+     until the next GO, so the robot always follows a stable path.
 
-Static obstacles:
-  The MOG2 background model is learned for `learning_frames` frames and then frozen
-  (bg_learning_rate = 0.0), so an obstacle that stops moving is never absorbed into
-  the background and never disappears from the costmap.
+What counts as GO (either one works):
+  - a new message on `world_path`  (set plan_on_path:=false to disable this)
+  - an std_msgs/Empty message on `plan_trigger`
+Extra:
+  - an std_msgs/Empty message on `recalibrate` throws the background away and learns it again.
+
+The robot itself is removed from the foreground mask using a parallax-shifted body mask,
+a metric margin, and blob ownership (blobs mostly inside the robot zone are erased).
 """
 
 import math
@@ -27,6 +33,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, qos
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import Image
+from std_msgs.msg import Empty
 
 LATCHED_QOS = QoSProfile(
     depth=1,
@@ -113,22 +120,23 @@ class ObstaclePlannerNode(Node):
 
         self.declare_parameter("cal_file", "")
         self.declare_parameter("robot_radius", 0.20)
-        self.declare_parameter("safety_margin", 0.15)
+        self.declare_parameter("safety_margin", 0.05)
         self.declare_parameter("grid_res", 0.05)
         self.declare_parameter("world_frame", "world")
 
-        # --- Background model parameters ---
-        # Frames used to learn the empty scene. Keep the scene free of obstacles during this time.
-        self.declare_parameter("learning_frames", 100)
-        # Learning rate after calibration. 0.0 = frozen background: static obstacles never fade.
-        # A tiny value (e.g. 0.00005) tracks slow lighting drift but obstacles will eventually fade.
-        self.declare_parameter("bg_learning_rate", 0.0)
+        # --- Background model ---
+        self.declare_parameter("learning_frames", 100)   # frames used to learn the empty floor
+        self.declare_parameter("bg_learning_rate", 0.0)  # 0.0 = frozen after calibration
 
-        # --- Robot masking parameters ---
+        # --- One-shot planning ---
+        self.declare_parameter("plan_on_path", True)     # a new world_path message counts as GO
+        self.declare_parameter("plan_frames", 5)         # frames captured per plan
+        self.declare_parameter("vote_frac", 0.6)         # pixel must be foreground in this fraction
+
+        # --- Robot masking ---
         self.declare_parameter("mask_scale", 2.0)    # multiplies robot radius for the image mask
-        self.declare_parameter("mask_margin", 0.15)  # extra metres around the robot
+        self.declare_parameter("mask_margin", 0.01)  # extra metres around the robot
         self.declare_parameter("parallax", 0.20)     # shift of robot top away from image centre (fraction)
-        self.declare_parameter("trail_len", 10)      # past frames of robot position to mask
         self.declare_parameter("owner_frac", 0.4)    # blob removed if >= this fraction lies in robot zone
 
         cal_file = self.get_parameter("cal_file").value
@@ -140,21 +148,27 @@ class ObstaclePlannerNode(Node):
         self.learning_frames = int(self.get_parameter("learning_frames").value)
         self.bg_learning_rate = float(self.get_parameter("bg_learning_rate").value)
 
+        self.plan_on_path = bool(self.get_parameter("plan_on_path").value)
+        self.plan_frames = max(1, int(self.get_parameter("plan_frames").value))
+        self.vote_frac = float(self.get_parameter("vote_frac").value)
+
         self.mask_scale = float(self.get_parameter("mask_scale").value)
         self.mask_margin = float(self.get_parameter("mask_margin").value)
         self.parallax = float(self.get_parameter("parallax").value)
         self.owner_frac = float(self.get_parameter("owner_frac").value)
-        self.trail = collections.deque(maxlen=max(1, int(self.get_parameter("trail_len").value)))
 
         self.H = load_calibration(cal_file)
         self.H_inv = np.linalg.inv(self.H)
 
-        # detectShadows=False fixes the extreme CPU lag.
-        # varThreshold=150 ensures minor lighting changes don't trigger obstacles.
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=150, detectShadows=False)
+        self.bg_subtractor = self.make_subtractor()
 
-        # --- Background Calibration Variables ---
+        # --- State ---
         self.frame_count = 0
+        self.calibrated = False
+        self.pending = False       # a plan has been requested and frames are being collected
+        self.collected = 0
+        self.vote_acc = None
+        self.plan_view = None      # last plan result, kept only for the debug image
 
         self.pose = None      # (x, y, yaw)
         self.world_path = []  # List of (x, y)
@@ -175,11 +189,20 @@ class ObstaclePlannerNode(Node):
         self.create_subscription(PoseStamped, "robot_pose", self.on_pose, 10)
         self.create_subscription(Path, "world_path", self.on_path, LATCHED_QOS)
         self.create_subscription(Image, "camera/image_raw", self.on_image, qos_profile_sensor_data)
+        self.create_subscription(Empty, "plan_trigger", self.on_plan_trigger, 10)
+        self.create_subscription(Empty, "recalibrate", self.on_recalibrate, 10)
 
         self.get_logger().info(
-            f"Obstacle Planner Initialized (learning_frames={self.learning_frames}, "
-            f"bg_learning_rate={self.bg_learning_rate})"
+            f"Obstacle Planner Initialized (one-shot mode, learning_frames={self.learning_frames}, "
+            f"bg_learning_rate={self.bg_learning_rate}, plan_frames={self.plan_frames})"
         )
+
+    # ------------------------------------------------------------------ setup helpers
+    @staticmethod
+    def make_subtractor():
+        # detectShadows=False fixes the extreme CPU lag.
+        # varThreshold=150 ensures minor lighting changes don't trigger obstacles.
+        return cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=150, detectShadows=False)
 
     def init_grid_mapping(self, height, width):
         """Calculates metric bounds from the camera view corners via homography."""
@@ -203,77 +226,150 @@ class ObstaclePlannerNode(Node):
         self.M_grid_to_img = np.linalg.inv(self.M_img_to_grid)
         self.grid_bounds_computed = True
 
+    # ------------------------------------------------------------------ callbacks
     def on_pose(self, msg):
         q = msg.pose.orientation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.pose = (msg.pose.position.x, msg.pose.position.y, yaw)
 
     def on_path(self, msg):
+        """A new world_path is treated as GO (unless plan_on_path is false)."""
         self.world_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
 
+        if len(self.world_path) < 2:
+            # Empty / cancelled path: forward it unchanged so the follower stops.
+            self.pending = False
+            self.publish_path(self.world_path)
+            return
+
+        if not self.plan_on_path:
+            return
+
+        if not self.calibrated:
+            # Obstacles are only placed after calibration, so this cannot be a real GO yet.
+            self.get_logger().info("Path received before calibration finished; waiting for GO after calibration.")
+            return
+
+        self.request_plan("new world_path")
+
+    def on_plan_trigger(self, _msg):
+        self.request_plan("plan_trigger")
+
+    def on_recalibrate(self, _msg):
+        self.bg_subtractor = self.make_subtractor()
+        self.frame_count = 0
+        self.calibrated = False
+        self.pending = False
+        self.vote_acc = None
+        self.plan_view = None
+        self.get_logger().info("Recalibrating background. Keep the floor free of obstacles.")
+
+    def request_plan(self, reason):
+        if len(self.world_path) < 2:
+            self.get_logger().warn("Plan requested but no valid world_path has been received yet.")
+            return
+        if not self.calibrated:
+            self.get_logger().warn("Plan requested but background calibration is not finished yet.")
+            return
+        self.pending = True
+        self.collected = 0
+        self.vote_acc = None
+        self.get_logger().info(f"Planning requested ({reason}); capturing {self.plan_frames} frames.")
+
+    # ------------------------------------------------------------------ image handling
+    def on_image(self, msg):
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        if not self.grid_bounds_computed:
+            self.init_grid_mapping(msg.height, msg.width)
+
+        # Phase 1: learn the empty floor, then freeze.
+        if not self.calibrated:
+            self.learn_background(frame, msg.header)
+            return
+
+        # Phase 2: idle until GO. Only process frames while a plan is pending.
+        banner = None
+        if self.pending:
+            if self.pose is None:
+                banner = "WAITING FOR ROBOT POSE"
+            else:
+                self.collect_frame(frame)
+                if self.pending:
+                    banner = f"PLANNING {self.collected}/{self.plan_frames}"
+
+        self.publish_live_debug(frame, msg.header, banner)
+
+    def learn_background(self, frame, header):
+        blurred = cv2.GaussianBlur(frame, (11, 11), 0)
+        # Automatic learning rate (-1) builds the model quickly
+        self.bg_subtractor.apply(blurred)
+        self.frame_count += 1
+
+        if self.frame_count >= self.learning_frames:
+            self.calibrated = True
+            self.get_logger().info("Background calibration done. Place obstacles, then press GO.")
+
+        if self.debug_pub.get_subscription_count() > 0:
+            debug_frame = frame.copy()
+            cv2.putText(debug_frame,
+                        f"LEARNING BACKGROUND: {min(self.frame_count, self.learning_frames)}/{self.learning_frames}",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+            self.publish_debug(debug_frame, header)
+
+    def foreground_mask(self, blurred):
+        """Foreground against the frozen background model."""
+        fg = self.bg_subtractor.apply(blurred, learningRate=self.bg_learning_rate)
+        _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+        # NOISE REMOVAL: Morphological opening to destroy tiny false-positive specks
+        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        return cv2.morphologyEx(fg, cv2.MORPH_OPEN, noise_kernel)
+
+    def collect_frame(self, frame):
+        """Adds one frame to the majority vote; plans when enough frames are collected."""
+        blurred = cv2.GaussianBlur(frame, (11, 11), 0)
+        fg = self.foreground_mask(blurred)
+
+        if self.vote_acc is None:
+            self.vote_acc = np.zeros(fg.shape, np.uint16)
+        self.vote_acc += (fg > 0).astype(np.uint16)
+        self.collected += 1
+
+        if self.collected < self.plan_frames:
+            return
+
+        need = int(math.ceil(self.vote_frac * self.plan_frames))
+        fg_mask = ((self.vote_acc >= need).astype(np.uint8)) * 255
+        self.vote_acc = None
+        self.pending = False
+        self.plan(fg_mask, frame.shape)
+
     def build_robot_mask(self, shape, u, v, px_per_m):
-        """Image-space mask covering the robot body, its parallax shift, and recent motion."""
+        """Image-space mask covering the robot body and its parallax shift (robot is stationary at GO)."""
         h, w = shape[:2]
         mask = np.zeros((h, w), np.uint8)
         radius = max(1, int((self.robot_radius * self.mask_scale + self.mask_margin) * px_per_m))
         cx, cy = w / 2.0, h / 2.0
 
-        self.trail.append((u, v))
-        for tu, tv in self.trail:
-            # Tall robot: its top appears displaced away from the image centre
-            top_u = tu + (tu - cx) * self.parallax
-            top_v = tv + (tv - cy) * self.parallax
-            for t in np.linspace(0.0, 1.0, 5):
-                pt = (int(tu + (top_u - tu) * t), int(tv + (top_v - tv) * t))
-                cv2.circle(mask, pt, radius, 255, -1)
+        # Tall robot: its top appears displaced away from the image centre
+        top_u = u + (u - cx) * self.parallax
+        top_v = v + (v - cy) * self.parallax
+        for t in np.linspace(0.0, 1.0, 5):
+            pt = (int(u + (top_u - u) * t), int(v + (top_v - v) * t))
+            cv2.circle(mask, pt, radius, 255, -1)
         return mask
 
-    def on_image(self, msg):
-        if not self.pose:
-            return
+    # ------------------------------------------------------------------ planning (runs once per GO)
+    def plan(self, fg_mask, frame_shape):
+        h, w = frame_shape[:2]
+        rx, ry, _ = self.pose
 
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-        if not self.grid_bounds_computed:
-            self.init_grid_mapping(msg.height, msg.width)
-
-        rx, ry, ryaw = self.pose
-
-        # Calculate pixel coordinates of the robot and pixels-per-metre at its location
+        # Pixel coordinates of the robot and pixels-per-metre at its location
         u, v = world_to_pixel((rx, ry), self.H_inv)
         u_edge, v_edge = world_to_pixel((rx + self.robot_radius, ry), self.H_inv)
         px_per_m = math.hypot(u - u_edge, v - v_edge) / self.robot_radius
 
-        # --- STEP A: Image Processing & Calibration ---
-        # LIGHTING FIX: Apply Gaussian Blur to the raw frame to smooth out noise
-        blurred_frame = cv2.GaussianBlur(frame, (11, 11), 0)
-
-        self.frame_count += 1
-
-        # Phase 1: Calibration (Learn the background)
-        if self.frame_count <= self.learning_frames:
-            # Automatic learning rate (-1) builds the model quickly (~1/min(frames, history))
-            self.bg_subtractor.apply(blurred_frame)
-
-            if self.debug_pub.get_subscription_count() > 0:
-                debug_frame = frame.copy()
-                cv2.putText(debug_frame, f"LEARNING BACKGROUND: {self.frame_count}/{self.learning_frames}",
-                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
-                self.publish_debug(debug_frame, msg.header)
-
-            # Stop here and wait for the next frame until learning is done
-            return
-
-        # Phase 2: Operation (background frozen when bg_learning_rate = 0.0)
-        # A frozen model never promotes a stationary obstacle to background, so it never disappears.
-        fg_mask = self.bg_subtractor.apply(blurred_frame, learningRate=self.bg_learning_rate)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-        # NOISE REMOVAL: Morphological opening to destroy tiny false-positive specks
-        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, noise_kernel)
-
-        # --- STEP A.2: Robot Masking ---
-        robot_mask = self.build_robot_mask(frame.shape, u, v, px_per_m)
+        # --- Robot masking ---
+        robot_mask = self.build_robot_mask(frame_shape, u, v, px_per_m)
 
         # Remove whole blobs that mostly belong to the robot (shadow/body fringe outside the mask)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
@@ -283,101 +379,92 @@ class ObstaclePlannerNode(Node):
             owned = inside >= self.owner_frac * area
             owned[0] = False  # label 0 is background
             fg_mask[owned[labels]] = 0
-
         fg_mask[robot_mask > 0] = 0
 
-        # --- STEP B: Perspective Correction & C-Space Dilation ---
+        # --- Perspective correction & C-Space dilation ---
         metric_grid = cv2.warpPerspective(fg_mask, self.M_img_to_grid, (self.grid_shape[1], self.grid_shape[0]))
         kernel_r = int((self.robot_radius + self.safety_margin) / self.grid_res)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_r * 2 + 1, kernel_r * 2 + 1))
         c_space = cv2.dilate(metric_grid, kernel)
 
-        state_msg = "NO PATH"
-        safe_world_path = self.world_path
-        detour_computed = False
+        # --- Check the original path (every segment is sampled, so thin obstacles between waypoints count) ---
+        flags = self.blocked_flags(c_space, self.world_path)
         blocked_idx = -1
         safe_idx = -1
-
-        if len(self.world_path) >= 2:
-            # --- STEP C: Temporal Projection & Reconnection ---
-            # Project robot 0.2m forward
-            px = rx + 0.2 * math.cos(ryaw)
-            py = ry + 0.2 * math.sin(ryaw)
-            start_grid = self.world_to_grid_pt((px, py))
-            start_grid = self.get_free_start(c_space, start_grid)
-
-            # Check original path for collisions
-            consecutive_safe = 0
-            for i, (wx, wy) in enumerate(self.world_path):
-                gx, gy = self.world_to_grid_pt((wx, wy))
-                if not (0 <= gx < self.grid_shape[1] and 0 <= gy < self.grid_shape[0]):
-                    continue
-
-                is_occupied = c_space[gy, gx] > 0
-                if is_occupied and blocked_idx == -1:
-                    blocked_idx = i
-                    consecutive_safe = 0
-                elif not is_occupied and blocked_idx != -1:
-                    consecutive_safe += 1
-                    if consecutive_safe > 5:  # Require 5 safe points to prevent jumping into pockets
-                        safe_idx = i - 5
-                        break
-                else:
-                    consecutive_safe = 0
-
-            # --- STEP D: A* Planning & Smoothing ---
-            if blocked_idx != -1:
-                state_msg = "PATH BLOCKED"
-                if safe_idx == -1:
-                    safe_idx = len(self.world_path) - 1
-                goal_grid = self.world_to_grid_pt(self.world_path[safe_idx])
-
-                raw_grid_path = a_star(c_space, start_grid, goal_grid)
-                if not raw_grid_path:
-                    state_msg = "E-STOP: NO DETOUR"
-                    safe_world_path = []  # Trigger E-Stop
-                else:
-                    state_msg = "DETOUR COMPUTED"
-                    detour_computed = True
-                    smooth_grid_path = smooth_path(raw_grid_path, window=5)
-                    detour_world = [self.grid_to_world_pt(pt) for pt in smooth_grid_path]
-
-                    # Find history split (closest point behind robot)
-                    distances = [math.hypot(rx - wx, ry - wy) for wx, wy in self.world_path[:blocked_idx]]
-                    closest_idx = int(np.argmin(distances)) if distances else 0
-
-                    # Stitch: [History] + [A*] + [Remaining]
-                    safe_world_path = self.world_path[:closest_idx] + detour_world + self.world_path[safe_idx:]
+        consecutive_safe = 0
+        for i, occupied in enumerate(flags):
+            if occupied and blocked_idx == -1:
+                blocked_idx = i
+                consecutive_safe = 0
+            elif not occupied and blocked_idx != -1:
+                consecutive_safe += 1
+                if consecutive_safe > 5:  # Require 5 safe points to prevent jumping into pockets
+                    safe_idx = i - 5
+                    break
             else:
-                state_msg = "PATH CLEAR"
+                consecutive_safe = 0
 
+        safe_world_path = self.world_path
+
+        if blocked_idx == -1:
+            state_msg = "PATH CLEAR"
+        else:
+            if safe_idx == -1:
+                safe_idx = len(self.world_path) - 1
+
+            start_grid = self.get_free_start(c_space, self.world_to_grid_pt((rx, ry)))
+            goal_grid = self.world_to_grid_pt(self.world_path[safe_idx])
+            raw_grid_path = a_star(c_space, start_grid, goal_grid)
+
+            if not raw_grid_path:
+                state_msg = "E-STOP: NO DETOUR"
+                safe_world_path = []  # Trigger E-Stop
+                self.get_logger().warn("No detour found around the obstacle. Publishing empty path (E-STOP).")
+            else:
+                state_msg = "DETOUR COMPUTED"
+                smooth_grid_path = smooth_path(raw_grid_path, window=5)
+                detour_world = [self.grid_to_world_pt(pt) for pt in smooth_grid_path]
+
+                # History split (closest point behind the blockage)
+                distances = [math.hypot(rx - wx, ry - wy) for wx, wy in self.world_path[:blocked_idx]]
+                closest_idx = int(np.argmin(distances)) if distances else 0
+
+                # Stitch: [History] + [A*] + [Remaining]
+                safe_world_path = self.world_path[:closest_idx] + detour_world + self.world_path[safe_idx:]
+                self.get_logger().info(f"Detour computed ({len(detour_world)} points).")
+
+        if blocked_idx == -1:
+            self.get_logger().info("Path is clear. Publishing original path.")
+
+        # Publish ONCE. Latched QoS keeps it available until the next GO.
         self.publish_path(safe_world_path)
 
-        # --- STEP E: Rich Visualization ---
-        if self.debug_pub.get_subscription_count() > 0:
-            # 1. Overlay C-Space costmap
-            c_space_img = cv2.warpPerspective(c_space, self.M_grid_to_img, (frame.shape[1], frame.shape[0]))
-            red_overlay = np.zeros_like(frame)
-            red_overlay[:, :, 2] = c_space_img
-            debug = cv2.addWeighted(frame, 1.0, red_overlay, 0.5, 0)
+        # --- Store result for the debug image (no further processing happens until next GO) ---
+        c_space_img = cv2.warpPerspective(c_space, self.M_grid_to_img, (w, h))
+        overlay = np.zeros((h, w, 3), np.uint8)
+        overlay[:, :, 2] = c_space_img
+        contours, _ = cv2.findContours(robot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.plan_view = {
+            "overlay": overlay,
+            "contours": contours,
+            "old_pts": [world_to_pixel(pt, self.H_inv) for pt in self.world_path] if blocked_idx != -1 else [],
+            "new_pts": [world_to_pixel(pt, self.H_inv) for pt in safe_world_path],
+            "state": state_msg,
+        }
 
-            # 2. Draw Paths
-            if blocked_idx != -1:
-                old_pts = [world_to_pixel(pt, self.H_inv) for pt in self.world_path]
-                self.draw_dashed_polyline(debug, old_pts, (0, 255, 255), 2)
-
-            new_pts = [world_to_pixel(pt, self.H_inv) for pt in safe_world_path]
-            if new_pts:
-                pts_arr = np.array(new_pts, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(debug, [pts_arr], False, (0, 255, 0), 4)
-
-            # 3. Draw Robot Mask (real mask outline, so you can see what is being erased)
-            contours, _ = cv2.findContours(robot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(debug, contours, -1, (255, 0, 0), 2)
-
-            # 4. Text Overlay
-            cv2.putText(debug, state_msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
-            self.publish_debug(debug, msg.header)
+    def blocked_flags(self, c_space, path):
+        """flags[i] is True if the segment from path[i] to path[i+1] touches an occupied cell."""
+        rows, cols = c_space.shape
+        pts = [self.world_to_grid_pt(p) for p in path]
+        flags = []
+        for i, (gx, gy) in enumerate(pts):
+            nx, ny = pts[i + 1] if i + 1 < len(pts) else (gx, gy)
+            n = max(abs(nx - gx), abs(ny - gy)) + 1
+            xs = np.linspace(gx, nx, n).round().astype(int)
+            ys = np.linspace(gy, ny, n).round().astype(int)
+            ok = (xs >= 0) & (xs < cols) & (ys >= 0) & (ys < rows)
+            flags.append(bool(np.any(c_space[ys[ok], xs[ok]] > 0)))
+        return flags
 
     def world_to_grid_pt(self, pt):
         src = np.array([[[pt[0], pt[1]]]], dtype=np.float64)
@@ -390,7 +477,7 @@ class ObstaclePlannerNode(Node):
         return (float(dst[0, 0, 0]), float(dst[0, 0, 1]))
 
     def get_free_start(self, grid, start):
-        """BFS to find nearest unoccupied cell if robot is temporally trapped."""
+        """BFS to find nearest unoccupied cell if the robot's cell is inside the inflated obstacle."""
         if not (0 <= start[1] < grid.shape[0] and 0 <= start[0] < grid.shape[1]):
             return start
         if grid[start[1], start[0]] == 0:
@@ -409,6 +496,29 @@ class ObstaclePlannerNode(Node):
                         visited.add((nx, ny))
                         q.append((nx, ny))
         return start
+
+    # ------------------------------------------------------------------ visualization / publishing
+    def publish_live_debug(self, frame, header, banner=None):
+        """Live camera frame with the LAST plan drawn on it. Purely visual, never affects the path."""
+        if self.debug_pub.get_subscription_count() == 0:
+            return
+
+        pv = None if banner else self.plan_view
+        if pv is not None and pv["overlay"].shape == frame.shape:
+            debug = cv2.addWeighted(frame, 1.0, pv["overlay"], 0.5, 0)
+            if pv["old_pts"]:
+                self.draw_dashed_polyline(debug, pv["old_pts"], (0, 255, 255), 2)
+            if pv["new_pts"]:
+                pts_arr = np.array(pv["new_pts"], np.int32).reshape((-1, 1, 2))
+                cv2.polylines(debug, [pts_arr], False, (0, 255, 0), 4)
+            cv2.drawContours(debug, pv["contours"], -1, (255, 0, 0), 2)
+            text = pv["state"]
+        else:
+            debug = frame.copy()
+            text = banner or "READY: place obstacles, then press GO"
+
+        cv2.putText(debug, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+        self.publish_debug(debug, header)
 
     def draw_dashed_polyline(self, img, points, color, thickness=2, dash_length=15):
         """Draws a dashed line for the obstructed old path."""
