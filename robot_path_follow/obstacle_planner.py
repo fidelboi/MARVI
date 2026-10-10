@@ -108,7 +108,11 @@ class ObstaclePlannerNode(Node):
         self.H = load_calibration(cal_file)
         self.H_inv = np.linalg.inv(self.H)
 
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=30, detectShadows=False)
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=100, detectShadows=True)
+        
+        # --- Background Calibration Variables ---
+        self.frame_count = 0
+        self.learning_frames = 100
 
         self.pose = None      # (x, y, yaw)
         self.world_path = []  # List of (x, y)
@@ -169,15 +173,35 @@ class ObstaclePlannerNode(Node):
 
         rx, ry, ryaw = self.pose
 
-        # --- STEP A: Dynamic Robot Masking ---
+        # --- STEP A: Dynamic Robot Masking & Background Calibration ---
         u, v = world_to_pixel((rx, ry), self.H_inv)
         u_edge, v_edge = world_to_pixel((rx + self.robot_radius, ry), self.H_inv)
         px_radius = int(math.hypot(u - u_edge, v - v_edge) * 1.15)
         
         mask_frame = frame.copy()
         cv2.circle(mask_frame, (int(u), int(v)), px_radius, (0, 0, 0), -1)
-        fg_mask = self.bg_subtractor.apply(mask_frame,learningRate=0.0)
+
+        self.frame_count += 1
+
+        # Phase 1: Calibration (Learn the background)
+        if self.frame_count <= self.learning_frames:
+            # High learning rate allows the subtractor to build the model quickly
+            self.bg_subtractor.apply(mask_frame, learningRate=0.001)
+            
+            if self.debug_pub.get_subscription_count() > 0:
+                debug_frame = frame.copy()
+                cv2.putText(debug_frame, f"LEARNING BACKGROUND: {self.frame_count}/{self.learning_frames}", 
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                self.publish_debug(debug_frame, msg.header)
+            
+            # Stop here and wait for the next frame until learning is done
+            return
+
+        # Phase 2: Operation (Lock the background)
+        # learningRate=0.0 ensures static obstacles don't get absorbed into the background over time
+        fg_mask = self.bg_subtractor.apply(mask_frame, learningRate=0.0)
         _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
 
         # --- STEP B: Perspective Correction & C-Space Dilation ---
         metric_grid = cv2.warpPerspective(fg_mask, self.M_img_to_grid, (self.grid_shape[1], self.grid_shape[0]))
