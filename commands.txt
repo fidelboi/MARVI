@@ -1,0 +1,24 @@
+parameters and calibration files are in folder robot_path_follow/config/
+
+#first run this: will give link of camera and  drawer...
+ros2 run robot_path_follow camera_server --ros-args -p camera_index:=2
+
+#path mapper node
+ros2 run robot_path_follow path_mapper --ros-args -p cal_file:=ros_ws/src/robot_path_follow/config/cal.yaml -p spacing:=0.15
+
+#april tag detector node.... 
+ros2 run robot_path_follow apriltag_pose --ros-args --params-file ros_ws/src/robot_path_follow/config/params.yaml -p cal_file:=ros_ws/src/robot_path_follow/config/cal.yaml
+
+
+#path mapper node-- pure-pursuit
+ros2 run robot_path_follow path_follower_pure4 --ros-args   --params-file ros_ws/src/robot_path_follow/config/params.yaml   -r left_wheel/rpm:=motor2/cmd_rpm   -r right_wheel/rpm:=motor1/cmd_rpm
+
+
+#follow the carrot node
+ros2 run robot_path_follow path_follower_carrot --ros-args --params-file ros_ws/src/robot_path_follow/config/params.yaml
+
+
+
+ros2 run robot_path_follow path_mapper_node --ros-args \
+  -p cal_file:=ros_ws/src/robot_path_follow/config/cal.yaml \
+  -r world_path:=original_world_path

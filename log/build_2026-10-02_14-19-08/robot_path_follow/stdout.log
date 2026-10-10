@@ -1,0 +1,35 @@
+running egg_info
+creating build/robot_path_follow/robot_path_follow.egg-info
+writing build/robot_path_follow/robot_path_follow.egg-info/PKG-INFO
+writing dependency_links to build/robot_path_follow/robot_path_follow.egg-info/dependency_links.txt
+writing entry points to build/robot_path_follow/robot_path_follow.egg-info/entry_points.txt
+writing requirements to build/robot_path_follow/robot_path_follow.egg-info/requires.txt
+writing top-level names to build/robot_path_follow/robot_path_follow.egg-info/top_level.txt
+writing manifest file 'build/robot_path_follow/robot_path_follow.egg-info/SOURCES.txt'
+reading manifest file 'build/robot_path_follow/robot_path_follow.egg-info/SOURCES.txt'
+writing manifest file 'build/robot_path_follow/robot_path_follow.egg-info/SOURCES.txt'
+running build
+running build_py
+creating /home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/build
+creating /home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/build/lib
+creating /home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/build/lib/robot_path_follow
+copying robot_path_follow/__init__.py -> /home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/build/lib/robot_path_follow
+running install
+running install_lib
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/python3.10/site-packages/robot_path_follow
+copying /home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/build/lib/robot_path_follow/__init__.py -> /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/python3.10/site-packages/robot_path_follow
+byte-compiling /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/python3.10/site-packages/robot_path_follow/__init__.py to __init__.cpython-310.pyc
+running install_data
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/ament_index
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/ament_index/resource_index
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/ament_index/resource_index/packages
+copying resource/robot_path_follow -> /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/ament_index/resource_index/packages
+copying package.xml -> /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/robot_path_follow
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/robot_path_follow/launch
+creating /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/share/robot_path_follow/config
+running install_egg_info
+Copying build/robot_path_follow/robot_path_follow.egg-info to /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/python3.10/site-packages/robot_path_follow-0.1.0-py3.10.egg-info
+running install_scripts
+Installing camera_server script to /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/robot_path_follow
+Installing path_mapper script to /home/pie/ros_ws/src/robot_path_follow/install/robot_path_follow/lib/robot_path_follow
+writing list of installed files to '/home/pie/ros_ws/src/robot_path_follow/build/robot_path_follow/install.log'

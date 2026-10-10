@@ -1,0 +1,25 @@
+apriltag_pose:
+  ros__parameters:
+    tag_id: -1                # -1 = any tag36h11; set to your printed ID (e.g. 0)
+    heading_offset_deg: 0.0   # fix with 90 / 180 / -90 if the debug arrow is not the robot's front
+    camera_height_m: 0.0      # optional parallax correction, 0 = off
+    tag_height_m: 0.0
+    foot_x: 0.0
+    foot_y: 0.0
+
+path_follower:
+  ros__parameters:
+    wheel_radius: 0.0525     # 10.5 cm diameter
+    track_width: 0.34         # 30 cm frame + 2 x 2 cm (wheel centres, wheels just outside the frame)
+    max_rpm: 60.0             # SET to your motors' real max
+    max_linear: 0.10          # m/s
+    max_angular: 0.5        # rad/s
+    lookahead: 0.20           # m
+    goal_tolerance: 0.08      # m
+    rotate_threshold_deg: 60.0
+    rotate_speed: 0.4         # rad/s, raise if the motors stall when rotating in place
+    left_sign: 1              # set -1 if a wheel is mounted mirrored
+    right_sign: 1
+    invert_turn: false        # set true if the robot turns away from the path
+    left_topic: left_wheel/rpm
+    right_topic: right_wheel/rpm
