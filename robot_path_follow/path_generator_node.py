@@ -25,7 +25,10 @@ WHAT IT DOES
 TOPICS
   Sub:  camera/image_raw   sensor_msgs/Image        (bgr8, rgb8, bgra8, rgba8, mono8)
         robot_pose         geometry_msgs/PoseStamped (x, y in the world/floor frame, metres)
-        goal_pose          geometry_msgs/PoseStamped (x, y used)
+        goal_pose          geometry_msgs/PoseStamped (x, y used)  -> plan from robot to this goal
+        world_path         nav_msgs/Path             (latched) drop-in mode: its LAST point is the goal; if the
+                                                     path is free of obstacles it is republished unchanged,
+                                                     otherwise an A* detour to its end point is generated
         recalibrate        std_msgs/Empty            relearn the background from the camera
   Pub:  safe_world_path    nav_msgs/Path             (latched). EMPTY path = no route / E-STOP
         planner/obstacle_map nav_msgs/OccupancyGrid  (latched, inflated C-space, for RViz)
@@ -334,6 +337,7 @@ class PathGeneratorNode(Node):
         self.pose_time = None
 
         self.goal = None
+        self.ref_path = []          # optional path received on world_path
         self.need_plan = False
         self.path = []              # last published path (list of (x, y))
         self.path_px = []
@@ -344,7 +348,8 @@ class PathGeneratorNode(Node):
         self.occupied = None        # bool grid, confirmed obstacles
         self.c_space = None         # bool grid, inflated
         self.overlay = None
-        self.status = "STARTING"
+        self.status = "STARTING"                      # learning / pose problems (shown first)
+        self.plan_status = "WAITING FOR GOAL: publish goal_pose or world_path"
         self._warned_enc = False
 
         self.xmin = self.ymin = 0.0
@@ -363,6 +368,7 @@ class PathGeneratorNode(Node):
         self.create_subscription(Image, "camera/image_raw", self.on_image, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, "robot_pose", self.on_pose, 10)
         self.create_subscription(PoseStamped, "goal_pose", self.on_goal, 10)
+        self.create_subscription(Path, "world_path", self.on_world_path, LATCHED_QOS)
         self.create_subscription(Empty, "recalibrate", self.on_recalibrate, 10)
         self.create_timer(1.0 / max(0.5, float(g("plan_rate"))), self.on_timer)
 
@@ -389,9 +395,26 @@ class PathGeneratorNode(Node):
         self.pose_time = self.get_clock().now()
 
     def on_goal(self, msg):
+        self.ref_path = []
         self.goal = (msg.pose.position.x, msg.pose.position.y)
         self.need_plan = True
+        self.plan_status = "GOAL RECEIVED - planning"
         self.get_logger().info(f"New goal ({self.goal[0]:.2f}, {self.goal[1]:.2f}).")
+
+    def on_world_path(self, msg):
+        pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        if len(pts) < 2:                      # empty / cancelled path: forward it so the follower stops
+            self.ref_path = []
+            self.goal = None
+            self.need_plan = False
+            self.plan_status = "PATH CANCELLED"
+            self.publish_path([])
+            return
+        self.ref_path = pts
+        self.goal = pts[-1]
+        self.need_plan = True
+        self.plan_status = "world_path RECEIVED - planning"
+        self.get_logger().info(f"world_path received ({len(pts)} pts), goal = ({self.goal[0]:.2f}, {self.goal[1]:.2f}).")
 
     def on_recalibrate(self, _msg):
         self.use_refs = False
@@ -505,6 +528,7 @@ class PathGeneratorNode(Node):
         if not self.bg_ready:
             self.learn_step(blurred, frame.shape, fresh)
         elif fresh:
+            self.status = ""
             self.update_obstacles(blurred, robot_mask, frame.shape)
         else:
             self.status = "POSE STALE - obstacle map frozen"
@@ -565,7 +589,6 @@ class PathGeneratorNode(Node):
         np.clip(ev, 0, self.clear_frames, out=ev)
 
         occ = np.where(ev >= self.confirm, True, np.where(ev <= 0, False, self.occupied))
-        self.status = "TRACKING OBSTACLES"
         if not np.array_equal(occ, self.occupied):
             self.occupied = occ
             self.c_space = cv2.dilate(occ.astype(np.uint8), self.infl_kernel) > 0
@@ -576,14 +599,22 @@ class PathGeneratorNode(Node):
 
     # ------------------------------------------------------------------ planning loop
     def on_timer(self):
-        if self.goal is None or not self.bg_ready or self.c_space is None or not self.pose_fresh():
+        if self.goal is None:
+            return
+        if not self.bg_ready or self.c_space is None:
+            self.get_logger().info("Goal set, but the background is not ready yet.", throttle_duration_sec=3.0)
+            return
+        if not self.pose_fresh():
+            self.get_logger().warn("Goal set, but no fresh robot_pose is arriving - cannot plan.",
+                                   throttle_duration_sec=3.0)
+            self.plan_status = "NO FRESH robot_pose - cannot plan"
             return
         rx, ry = self.pose
         if math.hypot(self.goal[0] - rx, self.goal[1] - ry) < self.goal_tol:
             self.get_logger().info("Goal reached.")
             self.goal = None
             self.need_plan = False
-            self.status = "GOAL REACHED"
+            self.plan_status = "GOAL REACHED"
             return
 
         replan = self.need_plan
@@ -610,6 +641,10 @@ class PathGeneratorNode(Node):
             if not line_free(self.c_space, a, b):
                 return True
         return False
+
+    def ref_blocked(self):
+        cells = [self.world_to_cell(p) for p in self.ref_path]
+        return any(not line_free(self.c_space, a, b) for a, b in zip(cells[:-1], cells[1:]))
 
     def penalty_grid(self):
         free = (~self.c_space).astype(np.uint8)
@@ -654,15 +689,21 @@ class PathGeneratorNode(Node):
     def replan(self):
         self.need_plan = False
         self.planned_version = self.map_version
+        # Drop-in mode: keep the upstream path untouched when it is still obstacle-free.
+        if self.ref_path and not self.ref_blocked():
+            self.plan_status = "PATH CLEAR (original path)"
+            self.publish_path(self.ref_path)
+            self.get_logger().info("Original world_path is clear; republishing it unchanged.")
+            return
         pts, why = self.plan_path(self.pose, self.goal)
         if pts is None:
-            self.status = f"NO PATH: {why}"
+            self.plan_status = f"NO PATH: {why}"
             self.get_logger().warn(f"Planning failed: {why}.")
             if self.estop_on_failure:
                 self.publish_path([])
             return
-        straight = len(pts) >= 2 and not self.occupied.any()
-        self.status = "PATH CLEAR" if straight else f"PATH PLANNED ({len(pts)} pts)"
+        straight = not self.occupied.any()
+        self.plan_status = "PATH CLEAR" if straight else f"DETOUR PLANNED ({len(pts)} pts)"
         self.publish_path(pts)
         self.get_logger().info(f"Published path with {len(pts)} points.")
 
@@ -726,7 +767,8 @@ class PathGeneratorNode(Node):
         if self.goal is not None:
             gu, gv = project(self.H_inv, *self.goal)
             cv2.circle(dbg, (int(gu), int(gv)), 10, (255, 0, 255), 3)
-        cv2.putText(dbg, self.status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3)
+        cv2.putText(dbg, self.status or self.plan_status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 3)
 
         out = Image()
         out.header = header
