@@ -33,6 +33,8 @@ setup(
             "path_follower_pure3 = robot_path_follow.path_follower_pure3:main",
             "path_follower_pure4 = robot_path_follow.path_follower_pure4:main",
             "obstacle_planner = robot_path_follow.obstacle_planner:main",
+            "path_generator = robot_path_follow.path_generator_node:main",
+            "camera_server2 = robot_path_follow.camera_server_node2:main",
         ],
     },
 )

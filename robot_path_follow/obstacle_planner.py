@@ -120,7 +120,7 @@ class ObstaclePlannerNode(Node):
 
         self.declare_parameter("cal_file", "")
         self.declare_parameter("robot_radius", 0.20)
-        self.declare_parameter("safety_margin", 0.05)
+        self.declare_parameter("safety_margin", 0.15)
         self.declare_parameter("grid_res", 0.05)
         self.declare_parameter("world_frame", "world")
 
@@ -135,7 +135,7 @@ class ObstaclePlannerNode(Node):
 
         # --- Robot masking ---
         self.declare_parameter("mask_scale", 2.0)    # multiplies robot radius for the image mask
-        self.declare_parameter("mask_margin", 0.01)  # extra metres around the robot
+        self.declare_parameter("mask_margin", 0.15)  # extra metres around the robot
         self.declare_parameter("parallax", 0.20)     # shift of robot top away from image centre (fraction)
         self.declare_parameter("owner_frac", 0.4)    # blob removed if >= this fraction lies in robot zone
 

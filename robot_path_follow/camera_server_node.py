@@ -18,7 +18,7 @@ Parameters
 """
 
 import threading
-import numpy as np
+
 import cv2
 import rclpy
 from flask import Flask, Response, jsonify, request
@@ -75,18 +75,12 @@ class CameraServerNode(Node):
 
         self._frame = None
         self._frame_lock = threading.Lock()
-        
-        self._debug_frame = None
-        self._debug_lock = threading.Lock()
 
         # ---------------- ROS interfaces ----------------
         self.image_pub = self.create_publisher(Image, "camera/image_raw", qos_profile_sensor_data)
         self.info_pub = self.create_publisher(CameraInfo, "camera/camera_info", LATCHED_QOS)
         self.path_pub = self.create_publisher(Path, "pixel_path", LATCHED_QOS)
         self.clear_pub = self.create_publisher(Empty, "path_clear", 10)
-        
-        # Subscribe to the obstacle planner's rich visualization
-        self.create_subscription(Image, "planner/debug_image", self._debug_image_callback, qos_profile_sensor_data)
 
         info = CameraInfo()
         info.header.frame_id = self.frame_id
@@ -131,32 +125,18 @@ class CameraServerNode(Node):
         msg.data = frame.tobytes()
         self.image_pub.publish(msg)
 
-    def _debug_image_callback(self, msg):
-        """Receives the rich visualization from the obstacle planner."""
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-        with self._debug_lock:
-            self._debug_frame = frame
-
     def _mjpeg_generator(self):
         import time
         last = None
         while True:
-            # 1. Try to get the debug frame first
-            with self._debug_lock:
-                frame_to_stream = self._debug_frame
-            
-            # 2. Fall back to raw camera frame if debug isn't available yet
-            if frame_to_stream is None:
-                with self._frame_lock:
-                    frame_to_stream = self._frame
-
-            if frame_to_stream is None or frame_to_stream is last:
+            with self._frame_lock:
+                frame = self._frame
+            if frame is None or frame is last:
                 time.sleep(0.01)
                 continue
-            
-            last = frame_to_stream
+            last = frame
 
-            ok, buf = cv2.imencode(".jpg", frame_to_stream,
+            ok, buf = cv2.imencode(".jpg", frame,
                                    [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
                 continue
