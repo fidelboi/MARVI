@@ -91,7 +91,7 @@ class PurePursuit:
 
             w = 2.0 * v * math.sin(alpha) / max(ld, 0.05)
             w = max(-self.max_angular, min(self.max_angular, w))
-            print(f"v: {v}, w: {w} self.max_linear: {self.max_linear}, self.max_angular: {self.max_angular}, speed_factor: {speed_factor}, heading_factor: {heading_factor}, alpha: {alpha}, ld: {ld}")
+            #print(f"v: {v}, w: {w} self.max_linear: {self.max_linear}, self.max_angular: {self.max_angular}, speed_factor: {speed_factor}, heading_factor: {heading_factor}, alpha: {alpha}, ld: {ld}")
             
 
         if self.invert_turn:
@@ -160,7 +160,9 @@ def wheel_rpm(v, w, wheel_radius, track_width, max_rpm):
     biggest = max(abs(left), abs(right))
     if biggest > max_rpm > 0.0:
         scale = max_rpm / biggest
-        left, right = left * scale, right * scale
+        left, right = left * scale, right * scale 
+        
+    print(f"wheel_rpm: v={v:.3f}, w={w:.3f},  left={left:.1f}, right={right:.1f}")
     return left, right
 
 
@@ -273,11 +275,16 @@ class PathFollowerNode(Node):
         l, r = Float64(), Float64()
         l.data = float(left * self.left_sign)
         r.data = float(right * self.right_sign)
+        #print(f"Publishing RPM: left={l.data:.1f}, right={r.data:.1f}")
         self.left_pub.publish(l)
         self.right_pub.publish(r)
 
 
 def main(args=None):
+    
+    print("==========================================", flush=True)
+    print("  RUNNING PATH FOLLOWER PURE 4 NODE       ", flush=True)
+    print("==========================================", flush=True)
     rclpy.init(args=args)
     node = PathFollowerNode()
     try:

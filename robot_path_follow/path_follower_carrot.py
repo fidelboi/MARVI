@@ -238,6 +238,9 @@ class StraightFollowerNode(Node):
 
 
 def main(args=None):
+    print("==========================================", flush=True)
+    print("  RUNNING PATH FOLLOWER CARROT NODE       ", flush=True)
+    print("==========================================", flush=True)
     rclpy.init(args=args)
     node = StraightFollowerNode()
     try:

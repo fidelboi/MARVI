@@ -1,4 +1,0 @@
-[console_scripts]
-camera_server = robot_path_follow.camera_server_node:main
-path_mapper = robot_path_follow.path_mapper_node:main
-

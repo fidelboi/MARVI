@@ -21,6 +21,7 @@ import threading
 import numpy as np
 import cv2
 import rclpy
+import time
 from flask import Flask, Response, jsonify, request
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
@@ -43,6 +44,12 @@ class CameraServerNode(Node):
 
     def __init__(self):
         super().__init__("camera_server")
+        
+        self._frame_lock = threading.Lock()
+        
+        self._debug_frame = None
+        self._debug_time = 0.0  # ADD THIS LINE
+        self._debug_lock = threading.Lock()
 
         # ---------------- parameters ----------------
         self.declare_parameter("camera_index", 2)
@@ -136,6 +143,7 @@ class CameraServerNode(Node):
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
         with self._debug_lock:
             self._debug_frame = frame
+            self._debug_time = time.time()  # ADD THIS LINE
 
     def _mjpeg_generator(self):
         import time
@@ -143,6 +151,9 @@ class CameraServerNode(Node):
         while True:
             # 1. Try to get the debug frame first
             with self._debug_lock:
+                frame_to_stream = self._debug_frame
+                if self._debug_frame is not None and (time.time() - self._debug_time) > 0.5:
+                    self._debug_frame = None 
                 frame_to_stream = self._debug_frame
             
             # 2. Fall back to raw camera frame if debug isn't available yet

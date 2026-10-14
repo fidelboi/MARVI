@@ -12,12 +12,12 @@ path_follower:
     wheel_radius: 0.0525     # 10.5 cm diameter
     track_width: 0.34         # 30 cm frame + 2 x 2 cm (wheel centres, wheels just outside the frame)
     max_rpm: 60.0             # SET to your motors' real max
-    max_linear: 0.10          # m/s
-    max_angular: 0.5        # rad/s
+    max_linear: 0.08         # m/s
+    max_angular: 0.3       # rad/s
     lookahead: 0.20           # m
     goal_tolerance: 0.08      # m
     rotate_threshold_deg: 60.0
-    rotate_speed: 0.4         # rad/s, raise if the motors stall when rotating in place
+    rotate_speed: 0.3         # rad/s, raise if the motors stall when rotating in place
     left_sign: 1              # set -1 if a wheel is mounted mirrored
     right_sign: 1
     invert_turn: false        # set true if the robot turns away from the path
