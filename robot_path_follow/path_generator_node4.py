@@ -4,7 +4,7 @@ path_generator_node.py
 Camera-based obstacle-aware path generator (ROS 2, overhead camera + floor homography).
 
 WHAT IT DOES
-  1. Learns what the EMPTY floor looks like, either
+1. Learns what the EMPTY floor looks like, either
         a) from reference image file(s)   (parameter `reference_images`), or
         b) from the first `learning_frames` camera frames. By default this is done on an EMPTY floor:
            the robot must be out of the camera view, and no robot_pose is needed for calibration.
@@ -21,11 +21,11 @@ WHAT IT DOES
   5. The ORIGINAL path (`world_path`, or a straight line robot->goal when only `goal_pose` is given)
      is always the reference. Whenever the obstacle map changes, the part of it ahead of the robot is
      re-checked:
-        * free                -> the original path (rejoined from the robot) is published;
-        * blocked             -> the first obstacle-free point AFTER the blocked stretch is found, an A*
+- free                -> the original path (rejoined from the robot) is published;
+- blocked             -> the first obstacle-free point AFTER the blocked stretch is found, an A*
                                  detour robot -> that point is planned, and the result is stitched as
                                  [detour] + [rest of the original path];
-        * no reachable point  -> an EMPTY path is published (E-STOP) and the planning is retried every
+- no reachable point  -> an EMPTY path is published (E-STOP) and the planning is retried every
                                  `replan_retry_period` seconds until a route exists again.
      Because every re-evaluation starts again from the original path, the robot goes BACK to the original
      path as soon as the obstacle is removed.
@@ -52,10 +52,10 @@ CALIBRATION FILE (OpenCV YAML), same as before:
   homography_pixel_to_floor: !!opencv-matrix { rows: 3, cols: 3, dt: d, data: [...] }
 
 LIMITATIONS (inherent to a single camera + floor homography)
-  * The homography is valid only for points ON the floor. The top of a tall obstacle is projected
+- The homography is valid only for points ON the floor. The top of a tall obstacle is projected
     "behind" its base, so tall objects look larger/longer in the grid. The inflation margin and the
     fact that errors are conservative (extra occupied cells) make this safe, but not exact.
-  * Only with `calibrate_with_robot:=true`: if the robot is visible while the background is learned, the pixels under it are unknown until it
+- Only with `calibrate_with_robot:=true`: if the robot is visible while the background is learned, the pixels under it are unknown until it
     drives away; they are then learned automatically (`bg_min_samples` frames). An object placed exactly
     there during that moment would be absorbed into the background. Use empty-floor reference images
     to avoid this completely.
@@ -995,3 +995,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
